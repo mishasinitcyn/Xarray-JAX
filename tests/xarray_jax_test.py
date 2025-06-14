@@ -24,28 +24,12 @@ import xarray
 
 class XarrayJaxTest(absltest.TestCase):
 
-  def test_jax_array_wrapper_with_numpy_api(self):
-    # This is just a side benefit of making things work with xarray, but the
-    # JaxArrayWrapper does allow you to manipulate JAX arrays using the
-    # standard numpy API, without converting them to numpy in the process:
-    ones = jnp.ones((3, 4), dtype=np.float32)
-    x = xarray_jax.JaxArrayWrapper(ones)
-    x = np.abs((x + 2) * (x - 3))
-    x = x[:-1, 1:3]
-    x = np.concatenate([x, x + 1], axis=0)
-    x = np.transpose(x, (1, 0))
-    x = np.reshape(x, (-1,))
-    x = x.astype(np.int32)
-    self.assertIsInstance(x, xarray_jax.JaxArrayWrapper)
-    # An explicit conversion gets us out of JAX-land however:
-    self.assertIsInstance(np.asarray(x), np.ndarray)
-
   def test_jax_xarray_variable(self):
     def ops_via_xarray(inputs):
       x = xarray_jax.Variable(('lat', 'lon'), inputs)
       # We'll apply a sequence of operations just to test that the end result is
       # still a JAX array, i.e. we haven't converted to numpy at any point.
-      x = np.abs((x + 2) * (x - 3))
+      x = abs((x + 2) * (x - 3))
       x = x.isel({'lat': slice(0, -1), 'lon': slice(1, 3)})
       x = xarray.Variable.concat([x, x + 1], dim='lat')
       x = x.transpose('lon', 'lat')
@@ -69,7 +53,7 @@ class XarrayJaxTest(absltest.TestCase):
                                data=inputs,
                                coords={'lat': np.arange(3) * 10,
                                        'lon': np.arange(4) * 10})
-      x = np.abs((x + 2) * (x - 3))
+      x = abs((x + 2) * (x - 3))
       x = x.sel({'lat': slice(0, 20)})
       y = xarray_jax.DataArray(dims=('lat', 'lon'),
                                data=ones,
@@ -98,7 +82,7 @@ class XarrayJaxTest(absltest.TestCase):
               'time': np.arange(2),
               'lat': np.arange(3) * 10,
               'lon': np.arange(4) * 10})
-      x = np.abs((x + 2) * (x - 3))
+      x = abs((x + 2) * (x - 3))
       x = x.sel({'lat': slice(0, 20)})
       y = xarray_jax.Dataset(
           data_vars={'foo': (('lat', 'lon'), foo),
@@ -174,7 +158,7 @@ class XarrayJaxTest(absltest.TestCase):
         jax_coords={'lon': jnp.arange(4) * 10})
     # Verify the jax_coord 'lon' retains jax data, and has not been created
     # as an index coordinate:
-    self.assertIsInstance(inputs.coords['lon'].data, xarray_jax.JaxArrayWrapper)
+    self.assertIsInstance(inputs.coords['lon'].data, jax.Array)
     self.assertNotIn('lon', inputs.indexes)
 
     @jax.jit
@@ -184,7 +168,7 @@ class XarrayJaxTest(absltest.TestCase):
       self.assertIn('lat', v.indexes)
 
       # The jax_coord is passed with JAX array data:
-      self.assertIsInstance(v.coords['lon'].data, xarray_jax.JaxArrayWrapper)
+      self.assertIsInstance(v.coords['lon'].data, jax.Array)
       self.assertNotIn('lon', v.indexes)
 
       # Use the jax coord in the computation:
@@ -198,7 +182,7 @@ class XarrayJaxTest(absltest.TestCase):
 
     # Verify the jax_coord 'lon' has jax data in the output too:
     self.assertIsInstance(
-        outputs.coords['lon'].data, xarray_jax.JaxArrayWrapper)
+        outputs.coords['lon'].data, jax.Array)
     self.assertNotIn('lon', outputs.indexes)
 
     self.assertEqual(outputs.dims, inputs.dims)
@@ -241,7 +225,7 @@ class XarrayJaxTest(absltest.TestCase):
     )
     # Verify the jax_coord 'lon' retains jax data, and has not been created
     # as an index coordinate:
-    self.assertIsInstance(inputs.coords['lon'].data, xarray_jax.JaxArrayWrapper)
+    self.assertIsInstance(inputs.coords['lon'].data, jax.Array)
     self.assertNotIn('lon', inputs.indexes)
 
     @jax.jit
@@ -251,7 +235,7 @@ class XarrayJaxTest(absltest.TestCase):
       self.assertIn('lat', v.indexes)
 
       # The jax_coord is passed with JAX array data:
-      self.assertIsInstance(v.coords['lon'].data, xarray_jax.JaxArrayWrapper)
+      self.assertIsInstance(v.coords['lon'].data, jax.Array)
       self.assertNotIn('lon', v.indexes)
 
       # Use the jax coord in the computation:
@@ -265,7 +249,7 @@ class XarrayJaxTest(absltest.TestCase):
 
     # Verify the jax_coord 'lon' has jax data in the output too:
     self.assertIsInstance(
-        outputs.coords['lon'].data, xarray_jax.JaxArrayWrapper)
+        outputs.coords['lon'].data, jax.Array)
     self.assertNotIn('lon', outputs.indexes)
 
     self.assertEqual(outputs.dims, inputs.dims)
@@ -428,7 +412,7 @@ class XarrayJaxTest(absltest.TestCase):
 
       # The jax_coord 'time' should be passed in backed by a JAX array, but
       # not as an index coordinate.
-      self.assertIsInstance(d.coords['time'].data, xarray_jax.JaxArrayWrapper)
+      self.assertIsInstance(d.coords['time'].data, jax.Array)
       self.assertNotIn('time', d.indexes)
 
       return d + 1

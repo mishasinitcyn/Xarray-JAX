@@ -7,11 +7,7 @@ from .xarray_jax import (
     assign_coords,
     get_jax_coords,
     assign_jax_coords,
-    wrap,  # Retained for now, though it's an identity function for JAX arrays
-    unwrap,
     unwrap_data,
-    unwrap_vars,
-    unwrap_coords,
     jax_data,
     jax_vars,
     apply_ufunc,
@@ -29,11 +25,7 @@ __all__ = [
     "get_jax_coords",
     "assign_jax_coords",
     # Wrapping/unwrapping (post JaxArrayWrapper removal)
-    "wrap",
-    "unwrap",
     "unwrap_data",
-    "unwrap_vars",
-    "unwrap_coords",
     "jax_data",
     "jax_vars",
     # Function application
