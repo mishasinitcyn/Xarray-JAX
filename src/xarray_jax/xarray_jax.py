@@ -22,10 +22,14 @@ returns xarray.Dataset, DataArray and Variable.
 ## Creating xarray datatypes from jax arrays, and vice-versa.
 
 You can use the xarray_jax.{Variable,DataArray,Dataset} constructors, which have
-the same API as the standard xarray constructors but accept JAX arrays directly,
-via the Python Array API standard.
+the same API as the standard xarray constructors but will accept JAX arrays
+without converting them to numpy.
 
-To get JAX arrays out the other end, you can use:
+It does this by wrapping the JAX array in a wrapper before passing it to
+xarray; you can also do this manually by calling xarray_jax.wrap on your JAX
+arrays before passing them to the standard xarray constructors.
+
+To get non-wrapped JAX arrays out the other end, you can use e.g.:
 
   xarray_jax.jax_vars(dataset)
   xarray_jax.jax_data(dataset.some_var)
@@ -36,9 +40,20 @@ that you want to JIT or compute gradients through. If this is not the case and
 you want to support passing plain numpy arrays through as well as potentially
 JAX arrays, you can use:
 
+  xarray_jax.unwrap_vars(dataset)
   xarray_jax.unwrap_data(dataset.some_var)
 
-which will return the underlying data array (JAX or numpy) without complaint.
+which will unwrap the data if it is a wrapped JAX array, but otherwise pass
+it through to you without complaint.
+
+The wrapped JAX arrays aim to support all the core operations from the numpy
+array API that xarray expects, however there may still be some gaps; if you run
+into any problems around this, you may need to add a few more proxy methods onto
+the wrapper class below.
+
+In future once JAX and xarray support the new  Python array API standard
+(https://data-apis.org/array-api/latest/index.html), we hope to avoid the need
+for wrapping the JAX arrays like this.
 
 ## jax.jit and pmap of functions taking and returning xarray datatypes
 
@@ -84,7 +99,8 @@ the coordinate, but that wasn't going to work with a jax array anyway.
 import collections
 import contextlib
 import contextvars
-from typing import Any, Callable, Hashable, Iterator, Mapping, Optional, Union, Tuple, TypeVar
+from typing import Any, Callable, Iterator, Mapping, Optional, Union, Tuple, TypeVar, cast
+from typing import Hashable  # pylint: disable=deprecated-class
 
 import jax
 import jax.numpy as jnp
@@ -93,14 +109,18 @@ import tree
 import xarray
 
 
-def Variable(dims, data, **kwargs) -> xarray.Variable:  # pylint:disable=invalid-name
-  """A pass-through for xarray.Variable, for API consistency.
+# Types which we wrap with JaxArrayWrapper to allow creating xarray datatypes
+# from them.
+# Note this includes some non-Array types which jax sometimes needs to use as
+# leaves of pytrees, in order to ensure we can still use xarray datatypes as
+# internal pytree nodes in these cases.
+_WRAPPED_TYPES = (
+    jax.Array, jax.ShapeDtypeStruct, jax.stages.ArgInfo, jax.stages.OutInfo)
 
-  While xarray natively supports JAX arrays, this constructor is retained
-  for consistency with `xarray_jax.DataArray` and `xarray_jax.Dataset` and
-  for backward compatibility. It directly calls `xarray.Variable`.
-  """
-  return xarray.Variable(dims, data, **kwargs)
+
+def Variable(dims, data, **kwargs) -> xarray.Variable:  # pylint:disable=invalid-name
+  """Like xarray.Variable, but can wrap JAX arrays."""
+  return xarray.Variable(dims, wrap(data), **kwargs)
 
 
 _JAX_COORD_ATTR_NAME = '_jax_coord'
@@ -114,15 +134,10 @@ def DataArray(  # pylint:disable=invalid-name
     attrs=None,
     jax_coords=None,
     ) -> xarray.DataArray:
-  """Like xarray.DataArray, but with special handling for JAX-backed coordinates.
-
-  While xarray natively supports JAX arrays as data, this constructor provides
-  the special `jax_coords` argument. This allows specific coordinates to be
-  treated as JAX-traced objects, which is essential for JIT-compiling or
-  differentiating with respect to coordinate values.
+  """Like xarray.DataArray, but supports using JAX arrays.
 
   Args:
-    data: As for xarray.DataArray. JAX arrays are supported directly.
+    data: As for xarray.DataArray, except jax arrays are also supported.
     coords: Coordinates for the array, see xarray.DataArray. These coordinates
       must be based on plain numpy arrays or something convertible to plain
       numpy arrays. Their values will form a static part of the data structure
@@ -136,8 +151,8 @@ def DataArray(  # pylint:disable=invalid-name
     attrs: See xarray.DataArray.
     jax_coords: Additional coordinates, which *can* use JAX arrays. These
       coordinates will be treated as JAX data from the point of view of
-      jax.tree_util, meaning they will be passed as tracers into JIT'd
-      functions and can be differentiated through.
+      jax.tree_util, that means when JIT'ing they will be passed as tracers and
+      computation involving them will be JIT'd.
       Unfortunately a side-effect of this is that they can't be used as index
       coordinates (because xarray's indexing logic is not JIT-able). If you
       specify a coordinate with the same name as a dimension here, it will not
@@ -152,28 +167,25 @@ def DataArray(  # pylint:disable=invalid-name
       handled consistently so is something we encourage explicit control over.
 
   Returns:
-    An instance of xarray.DataArray.
+    An instance of xarray.DataArray. Where JAX arrays are used as data or
+    coords, they will be wrapped with JaxArrayWrapper and can be unwrapped via
+    `unwrap` and `unwrap_data`.
   """
   result = xarray.DataArray(
-      data, dims=dims, name=name, attrs=attrs or {})
+      wrap(data), dims=dims, name=name, attrs=attrs or {})
   return assign_coords(result, coords=coords, jax_coords=jax_coords)
 
 
 def Dataset(  # pylint:disable=invalid-name
-    data_vars,
+    data_vars=None,
     coords=None,
     attrs=None,
     jax_coords=None,
     ) -> xarray.Dataset:
-  """Like xarray.Dataset, but with special handling for JAX-backed coordinates.
-
-  While xarray natively supports JAX arrays as data variables, this constructor
-  provides the special `jax_coords` argument. This allows specific coordinates
-  to be treated as JAX-traced objects, which is essential for JIT-compiling or
-  differentiating with respect to coordinate values.
+  """Like xarray.Dataset, but can wrap JAX arrays.
 
   Args:
-    data_vars: As for xarray.Dataset. Note that JAX arrays are supported directly.
+    data_vars: As for xarray.Dataset, except jax arrays are also supported.
     coords: Coordinates for the dataset, see xarray.Dataset. These coordinates
       must be based on plain numpy arrays or something convertible to plain
       numpy arrays. Their values will form a static part of the data structure
@@ -185,8 +197,8 @@ def Dataset(  # pylint:disable=invalid-name
     attrs: See xarray.Dataset.
     jax_coords: Additional coordinates, which *can* use JAX arrays. These
       coordinates will be treated as JAX data from the point of view of
-      jax.tree_util, meaning they will be passed as tracers into JIT'd
-      functions and can be differentiated through.
+      jax.tree_util, that means when JIT'ing they will be passed as tracers and
+      computation involving them will be JIT'd.
       Unfortunately a side-effect of this is that they can't be used as index
       coordinates (because xarray's indexing logic is not JIT-able). If you
       specify a coordinate with the same name as a dimension here, it will not
@@ -201,12 +213,25 @@ def Dataset(  # pylint:disable=invalid-name
       handled consistently so is something we encourage explicit control over.
 
   Returns:
-    An instance of xarray.Dataset.
+    An instance of xarray.Dataset. Where JAX arrays are used as data, they
+    will be wrapped with JaxArrayWrapper.
   """
-  # The previous implementation had a loop to wrap data_vars. Since wrapping is
-  # no longer needed, we can pass data_vars directly to xarray.Dataset.
+  wrapped_data_vars = {}
+  for name, var_like in (data_vars or {}).items():
+    # xarray.Dataset accepts a few different formats for data_vars:
+    if isinstance(var_like, _WRAPPED_TYPES):
+      wrapped_data_vars[name] = wrap(var_like)
+    elif isinstance(var_like, tuple):
+      # Layout is (dims, data, ...). We wrap data.
+      wrapped_data_vars[name] = (var_like[0], wrap(var_like[1])) + var_like[2:]
+    else:
+      # Could be a plain numpy array or scalar (we don't wrap), or an
+      # xarray.Variable, DataArray etc, which we must assume is already wrapped
+      # if necessary (e.g. if creating using xarray_jax.{Variable,DataArray}).
+      wrapped_data_vars[name] = var_like
+
   result = xarray.Dataset(
-      data_vars=data_vars,
+      data_vars=wrapped_data_vars,
       attrs=attrs)
 
   return assign_coords(result, coords=coords, jax_coords=jax_coords)
@@ -271,13 +296,25 @@ def assign_coords(
   for name, coord in jax_coords.items():
     if isinstance(coord, xarray.DataArray):
       coord = coord.variable
+
+    if isinstance(coord, list):
+      coord = np.array(coord)
+
     if isinstance(coord, xarray.Variable):
       coord = coord.copy(deep=False)  # Copy before mutating attrs.
-    else:
-      # Must wrap as Variable with the correct dims first if this has not
-      # already been done, otherwise xarray.Dataset will assume the dimension
-      # name is also __NONINDEX_{n}.
+    elif isinstance(coord, tuple):
+      # A tuple represents a pair of (dims, data).
+      dims, data = coord
+      coord = Variable(dims, data)
+    elif jnp.isscalar(coord):
+      # A scalar coord maps to a scalar Variable:
+      coord = Variable(dims=(), data=coord)
+    elif isinstance(coord, jax.typing.ArrayLike) and jnp.ndim(coord) == 1:
+      # A 1D array maps to a 1D Variable whose dimension is the same as the
+      # coordinate name:
       coord = Variable((name,), coord)
+    else:
+      raise ValueError(f'Unsupported value for coordinate {name}')
 
     # We set an attr on each jax_coord identifying it as such. These attrs on
     # the coord Variable gets reflected on the coord DataArray exposed too, and
@@ -315,41 +352,186 @@ def assign_jax_coords(
   return assign_coords(x, jax_coords=jax_coords or jax_coords_kwargs)
 
 
+def wrap(value):
+  """Wraps JAX arrays for use in xarray, passing through other values."""
+  if isinstance(value, _WRAPPED_TYPES):
+    return JaxArrayWrapper(value)
+  else:
+    return value
+
+
+def unwrap(value, require_jax=False):
+  """Unwraps wrapped JAX arrays used in xarray, passing through other values."""
+  if isinstance(value, JaxArrayWrapper):
+    return value.jax_array
+  elif isinstance(value, jax.Array):
+    return value
+  elif require_jax:
+    raise TypeError(f'Expected JAX array, found {type(value)}.')
+  else:
+    return value
+
+
+def _wrapped(func):
+  """Surrounds a function with JAX array unwrapping/wrapping."""
+  def wrapped_func(*args, **kwargs):
+    args, kwargs = tree.map_structure(unwrap, (args, kwargs))
+    result = func(*args, **kwargs)
+    return tree.map_structure(wrap, result)
+  return wrapped_func
+
+
 def unwrap_data(
     value: Union[xarray.Variable, xarray.DataArray],
     require_jax: bool = False
     ) -> Union[jax.Array, np.ndarray]:
-  """The data of an xarray.Variable or DataArray."""
-  if require_jax and not isinstance(value.data, jax.Array):
-    raise TypeError(f'Expected JAX array, found {type(value.data)}.')
-  return value.data
+  """The unwrapped (see unwrap) data of a an xarray.Variable or DataArray."""
+  return unwrap(value.data, require_jax=require_jax)
+
+
+def unwrap_vars(
+    dataset: Mapping[Hashable, xarray.DataArray],
+    require_jax: bool = False
+    ) -> Mapping[str, Union[jax.Array, np.ndarray]]:
+  """The unwrapped data (see unwrap) of the variables in a dataset."""
+  # xarray types variable names as Hashable, but in practice they're invariably
+  # strings and we convert to str to allow for a more useful return type.
+  return {str(name): unwrap_data(var, require_jax=require_jax)
+          for name, var in dataset.items()}
+
+
+def unwrap_coords(
+    dataset: Union[xarray.Dataset, xarray.DataArray],
+    require_jax: bool = False
+    ) -> Mapping[str, Union[jax.Array, np.ndarray]]:
+  """The unwrapped data (see unwrap) of the coords in a Dataset or DataArray."""
+  return {str(name): unwrap_data(var, require_jax=require_jax)
+          for name, var in dataset.coords.items()}
 
 
 def jax_data(value: Union[xarray.Variable, xarray.DataArray]) -> jax.Array:
-  """The unwrapped data of an xarray.Variable or DataArray.
-
-  This will complain if not a jax array.
-  """
-  if not isinstance(value.data, jax.Array):
-    raise TypeError(f'Expected JAX array, found {type(value.data)}.')
-  return value.data
+  """Like unwrap_data, but will complain if not a jax array."""
+  # Implementing this separately so we can give a more specific return type
+  # for it.
+  return cast(jax.Array, unwrap_data(value, require_jax=True))
 
 
 def jax_vars(
     dataset: Mapping[Hashable, xarray.DataArray]) -> Mapping[str, jax.Array]:
-  """The data of the variables in a dataset.
+  """Like unwrap_vars, but will complain if vars are not all jax arrays."""
+  return cast(Mapping[str, jax.Array], unwrap_vars(dataset, require_jax=True))
 
-  This will complain if vars are not all jax arrays.
+
+class JaxArrayWrapper(np.lib.mixins.NDArrayOperatorsMixin):
+  """Wraps a JAX array into a duck-typed array suitable for use with xarray.
+
+  This uses an older duck-typed array protocol based on __array_ufunc__ and
+  __array_function__ which works with numpy and xarray. (In newer versions
+  of xarray it implements xarray.namedarray._typing._array_function.)
+
+  This is in the process of being superseded by the Python array API standard
+  (https://data-apis.org/array-api/latest/index.html), but JAX hasn't
+  implemented it yet. Once they have, we should be able to get rid of
+  this wrapper and use JAX arrays directly with xarray.
+
   """
-  return {str(name): jax_data(var) for name, var in dataset.items()}
+
+  def __init__(self, jax_array):
+    self.jax_array = jax_array
+
+  def __array_ufunc__(self, ufunc, method, *args, **kwargs):
+    for x in args:
+      if not isinstance(x, (jax.typing.ArrayLike, type(self))):
+        return NotImplemented
+    if method != '__call__':
+      return NotImplemented
+    try:
+      # Get the corresponding jax.numpy function to the NumPy ufunc:
+      func = getattr(jnp, ufunc.__name__)
+    except AttributeError:
+      return NotImplemented
+    # There may be an 'out' kwarg requesting an in-place operation, e.g. when
+    # this is called via __iadd__ (+=), __imul__ (*=) etc. JAX doesn't support
+    # in-place operations so we just remove this argument and have the ufunc
+    # return a fresh JAX array instead.
+    kwargs.pop('out', None)
+    return _wrapped(func)(*args, **kwargs)
+
+  def __array_function__(self, func, types, args, kwargs):
+    try:
+      # Get the corresponding jax.np function to the NumPy function:
+      func = getattr(jnp, func.__name__)
+    except AttributeError:
+      return NotImplemented
+    return _wrapped(func)(*args, **kwargs)
+
+  def __repr__(self):
+    return f'xarray_jax.JaxArrayWrapper({repr(self.jax_array)})'
+
+  # NDArrayOperatorsMixin already proxies most __dunder__ operator methods.
+  # We need to proxy through a few more methods in a similar way:
+
+  # Essential array properties:
+
+  @property
+  def shape(self):
+    return self.jax_array.shape
+
+  @property
+  def dtype(self):
+    return self.jax_array.dtype
+
+  @property
+  def ndim(self):
+    return self.jax_array.ndim
+
+  @property
+  def size(self):
+    return self.jax_array.size
+
+  @property
+  def real(self):
+    return self.jax_array.real
+
+  @property
+  def imag(self):
+    return self.jax_array.imag
+
+  # Array methods not covered by NDArrayOperatorsMixin:
+
+  # Allows conversion to numpy array using np.asarray etc. Warning: doing this
+  # will fail in a jax.jit-ed function.
+  def __array__(self, dtype=None, context=None):
+    return np.asarray(self.jax_array, dtype=dtype)
+
+  __getitem__ = _wrapped(lambda array, *args: array.__getitem__(*args))
+  # We drop the kwargs on this as they are not supported by JAX, but xarray
+  # uses at least one of them (the copy arg).
+  astype = _wrapped(lambda array, *args, **kwargs: array.astype(*args))
+
+  # There are many more methods which are more canonically available via (j)np
+  # functions, e.g. .sum() available via jnp.sum, and also mean, max, min,
+  # argmax, argmin etc. We don't attempt to proxy through all of these as
+  # methods, since this doesn't appear to be expected from a duck-typed array
+  # implementation. But there are a few which xarray calls as methods, so we
+  # proxy those:
+  transpose = _wrapped(jnp.transpose)
+  reshape = _wrapped(jnp.reshape)
+  all = _wrapped(jnp.all)
 
 
 def apply_ufunc(func, *args, require_jax=False, **apply_ufunc_kwargs):
   """Like xarray.apply_ufunc but for jax-specific ufuncs.
 
-  JAX arrays work directly with xarray via the Array API standard, so this is a
-  thin wrapper around xarray.apply_ufunc that optionally validates JAX array
-  inputs and provides a more useful error message (TypeError).
+  Many numpy ufuncs will work fine out of the box with xarray_jax and
+  JaxArrayWrapper, since JaxArrayWrapper quacks (mostly) like a numpy array and
+  will convert many numpy operations to jax ops under the hood. For these
+  situations, xarray.apply_ufunc should work fine.
+
+  But sometimes you need a jax-specific ufunc which needs to be given a
+  jax array as input or return a jax array as output. In that case you should
+  use this helper as it will remove any JaxArrayWrapper before calling the func,
+  and wrap the result afterwards before handing it back to xarray.
 
   Args:
     func: A function that works with jax arrays (e.g. using functions from
@@ -364,17 +546,12 @@ def apply_ufunc(func, *args, require_jax=False, **apply_ufunc_kwargs):
   Returns:
     Corresponding xarray results (see xarray.apply_ufunc).
   """
-  if require_jax:
-    # Validate that all array inputs are JAX arrays
-    def check_jax(arg):
-      if isinstance(arg, (xarray.DataArray, xarray.Variable)):
-        if not isinstance(arg.data, jax.Array):
-          raise TypeError(f'Expected JAX array in {type(arg).__name__}, found {type(arg.data)}')
-      return arg
-    args = tree.map_structure(check_jax, args)
-  
-  # Now just call xarray.apply_ufunc directly
-  return xarray.apply_ufunc(func, *args, **apply_ufunc_kwargs)
+  def wrapped_func(*maybe_wrapped_args):
+    unwrapped_args = [unwrap(a, require_jax) for a in maybe_wrapped_args]
+    result = func(*unwrapped_args)
+    # Result can be an array or a tuple of arrays, this handles both:
+    return jax.tree_util.tree_map(wrap, result)
+  return xarray.apply_ufunc(wrapped_func, *args, **apply_ufunc_kwargs)
 
 
 def pmap(fn: Callable[..., Any],
@@ -449,6 +626,187 @@ def pmap(fn: Callable[..., Any],
 
   return result_fn
 
+_PyTree = TypeVar('_PyTree')
+
+
+def tree_map_variables(
+    func: Callable[[xarray.Variable], xarray.Variable],
+    tree_data: _PyTree) -> _PyTree:
+  """Like jax.tree.map but operates with Variables as leaves.
+
+  This will work with any jax.tree_util-registered PyTree containing xarray
+  datatypes. All jax data in xarray datatypes is exposed via xarray.Variable
+  nodes by our registered flatten/unflatten functions and hence here too. Note
+  static coordinate data will not be mapped over however.
+
+  This allows you to see the associated dimensions for each leaf, and to change
+  them. If you change them, it's your responsibility to ensure that when
+  unflattened back into DataArray/Dataset/DataTree the result still makes sense.
+  In particular that any updated shapes are consistent with the shapes of any
+  static (non-jax_coord) coordinates, since these will not be mapped over.
+
+  Args:
+    func: Function from xarray.Variable to xarray.Variable.
+    tree_data: PyTree to be mapped over.
+
+  Returns:
+    PyTree with the same structure as `tree_data` but where xarray.Variables
+    within xarray datatypes have been mapped over by `func`. Any leaves outside
+    of xarray datatypes will be unchanged.
+  """
+  return jax.tree.map(
+      lambda leaf: func(leaf) if isinstance(leaf, xarray.Variable) else leaf,
+      tree_data,
+      is_leaf=lambda x: isinstance(x, xarray.Variable))
+
+
+def tree_map_with_dims(
+    func: Callable[[jax.typing.ArrayLike, tuple[str, ...] | None],
+                   jax.typing.ArrayLike],
+    data: _PyTree,
+) -> _PyTree:
+  """Like jax.tree.map but also passes in xarray dimensions where known.
+
+  This is convenient when applying logic to every jax array in some xarray data
+  structure, which wants to be sensitive to the xarray dimension names.
+  Typical examples of this would be jax operations relating to sharding where
+  you may want to map xarray dimension names to sharding axis names.
+
+  This only supports changing array shapes in limited situations (see below).
+
+  Unlike tree_map_variables above, this will also map over plain jax arrays
+  that don't occur within xarray.Variable nodes; these will be passed to func
+  with dims=None.
+
+  Args:
+    func: A function from (jax_array, dims) -> jax_array. dims will correspond
+      to the dimension names of the xarray.Variable containing the jax_array
+      where it occurs within an xarray.Variable, note this includes arrays
+      within xarray.Dataset and xarray.DataArray too. For plain jax arrays that
+      don't occur within an xarray.Variable, dims will be None.
+      The returned jax array should generally be of the same shape as the input.
+      However you can get away with changing the shape of a particular dimension
+      in limited circumstances: when there are no explicit coordinates involving
+      that dimension, or when the only coordinates involving that dimension are
+      jax_coords and you modify their shapes too in a consistent fashion.
+      You are not allowed to change the dimension order, add or remove
+      dimensions.
+    data: Any pytree with jax ArrayLike leaves suitable for use with
+      `jax.tree.map`. Thanks to xarray_jax such pytrees may include xarray
+      datatypes.
+
+  Returns:
+    A pytree of the same structure as data, with the result of applying func
+    to each jax array found.
+  """
+  # All jax arrays within xarray.Dataset, xarray.DataArray (including
+  # jax_coord arrays) will be exposed via xarray.Variable internal nodes by
+  # xarray_jax's pytree registrations. So to find xarray dimension metadata
+  # it's sufficient to stop descending at xarray.Variable nodes:
+  def is_leaf(x):
+    return isinstance(x, xarray.Variable)
+
+  def wrapped_func(x):
+    if isinstance(x, xarray.Variable):
+      array = unwrap(x.data)
+      array = func(array, x.dims)
+      return Variable(dims=x.dims, data=array)
+    else:
+      return func(x, None)
+
+  return jax.tree_util.tree_map(wrapped_func, data, is_leaf=is_leaf)
+
+
+_Carry = TypeVar('_Carry')
+_X = TypeVar('_X')
+_Y = TypeVar('_Y')
+
+
+def scan(f: Callable[[_Carry, _X], tuple[_Carry, _Y]],
+         init: _Carry,
+         dim: str,
+         xs: _X | None = None,
+         length: int | None = None,
+         reverse: bool = False,
+         unroll: int | bool = 1,
+         ) -> tuple[_Carry, _Y]:
+  """Like jax.lax.scan but supports xarray data.
+
+  This can handle a jax.tree containing any mix of xarray and plain jax data.
+  It scans along the dimension `dim` for xarray data, and the leading axis for
+  any non-xarray data. These scanned-along dimensions must all be consistent in
+  size.
+
+  Static coordinates along `dim` in the `xs` will not be present on the `x`
+  argument to `f`, since they would be different on each iteration and we can't
+  pass them through as static data. jax_coords will be passed through correctly
+  however.
+
+  Static coordinates along `dim` on the `xs` will also not be present on the
+  resulting `ys`, you will need to copy these across yourself if desired.
+  (This one we may be able to fix in future.)
+
+  Args:
+    f: Function to apply at each step of the scan. This should map
+      (carry, x) -> (carry, y), where `x` is a slice of the `xs` along the `dim`
+      axis (with the `dim` axis and any coordinates using it dropped), and `y`
+      is a slice of the desired output along the `dim` axis, with no `dim` axis
+      itself.
+      x, y and carry can in general be trees, in which the above applies to
+      each leaf of the tree.
+    init: Initial value of the carry.
+    dim: The xarray dimension name to scan along, for xarray data.
+    xs: The input to be scanned. If not provided, will scan over `length`
+      iterations with None passed as the `x` argument to `f`.
+    length: The length of the scan, if `xs` are not provided.
+    reverse: Whether to scan in reverse order.
+    unroll: How many steps to unroll the scan, see jax.lax.scan.
+
+  Returns:
+    final_carry: The carry returned from the final step of the scan.
+    ys: Data corresponding to the `y` returned from `f` on each step of the
+      scan, concatenated along an extra leading dimension (named `dim` for
+      xarray data).
+  """
+  if xs is not None:
+    # Ensure `dim` is the leading axis on any xarray data in the `xs`. This is
+    # what jax.lax.scan will scan over. (Any non-array data it's on you to put
+    # the relevant axis first).
+    xs = tree_map_variables(lambda v: v.transpose(dim, ...), xs)
+    xs_leaves, xs_treedef = jax.tree.flatten(xs)
+  else:
+    xs_treedef = None
+    xs_leaves = None
+
+  y_treedef = None
+
+  def scan_fn(carry, x_leaves):
+    if x_leaves is None:
+      x = None
+    else:
+      with dims_change_on_unflatten(lambda dims: dims[1:]):
+        x = jax.tree.unflatten(xs_treedef, x_leaves)
+    carry, y = f(carry, x)
+
+    nonlocal y_treedef
+    y_leaves, y_treedef = jax.tree.flatten(y)
+    return carry, y_leaves
+
+  final_carry, ys_leaves = jax.lax.scan(
+      scan_fn,
+      init,
+      xs_leaves,
+      length=length,
+      reverse=reverse,
+      unroll=unroll)
+
+  assert isinstance(y_treedef, jax.tree_util.PyTreeDef)
+
+  with dims_change_on_unflatten(lambda dims: (dim,) + dims):
+    ys = jax.tree.unflatten(y_treedef, ys_leaves)
+
+  return final_carry, ys
+
 
 # Register xarray datatypes with jax.tree_util.
 
@@ -496,7 +854,7 @@ def dims_change_on_unflatten(dims_change_fn: DimsChangeFn):
 
 
 def _flatten_variable(v: xarray.Variable) -> Tuple[
-    Tuple[jax.typing.ArrayLike], Tuple[Hashable, ...]]:
+    Tuple[jax.typing.ArrayLike], Tuple[Hashable, ...]]:  # pylint: disable=g-one-element-tuple
   """Flattens a Variable for jax.tree_util."""
   children = (unwrap_data(v),)
   aux = v.dims
@@ -505,7 +863,7 @@ def _flatten_variable(v: xarray.Variable) -> Tuple[
 
 def _unflatten_variable(
     aux: Tuple[Hashable, ...],
-    children: Tuple[jax.typing.ArrayLike]) -> xarray.Variable:
+    children: Tuple[jax.typing.ArrayLike]) -> xarray.Variable:  # pylint: disable=g-one-element-tuple
   """Unflattens a Variable for jax.tree_util."""
   dims = aux
   dims_change_fn = _DIMS_CHANGE_ON_UNFLATTEN_FN.get(None)
@@ -522,14 +880,14 @@ def _split_static_and_jax_coords(
     if coord.attrs.get(_JAX_COORD_ATTR_NAME, False):
       jax_coord_vars[name] = coord.variable
     else:
-      assert not isinstance(coord.data, jax.Array)
+      assert not isinstance(coord, (jax.Array, JaxArrayWrapper))
       static_coord_vars[name] = coord.variable
   return static_coord_vars, jax_coord_vars
 
 
 def _drop_with_none_of_dims(
     coord_vars: Mapping[Hashable, xarray.Variable],
-    dims: Tuple[Hashable]) -> Mapping[Hashable, xarray.Variable]:
+    dims: Tuple[Hashable, ...]) -> Mapping[Hashable, xarray.Variable]:
   return {name: var for name, var in coord_vars.items()
           if set(var.dims) <= set(dims)}
 
@@ -599,13 +957,15 @@ def _unflatten_data_array(
   """Unflattens a DataArray for jax.tree_util."""
   variable, jax_coord_vars = children
   name, static_coord_vars = aux
-  # Drop static coords which have dims not present in any of the data_vars.
-  # These would generally be dims that were dropped by a dims_change_fn, but
-  # because static coordinates don't go through dims_change_fn on unflatten, we
-  # just drop them where this causes a problem.
-  # Since jax_coords go through the dims_change_fn on unflatten we don't need
-  # to do this for jax_coords.
-  static_coord_vars = _drop_with_none_of_dims(static_coord_vars, variable.dims)
+  if _DIMS_CHANGE_ON_UNFLATTEN_FN.get(None):
+    # Drop static coords which have dims not present in any of the data_vars.
+    # These would generally be dims that were dropped by a dims_change_fn, but
+    # because static coordinates don't go through dims_change_fn on unflatten,
+    # we just drop them where this causes a problem.
+    # Since jax_coords go through the dims_change_fn on unflatten we don't need
+    # to do this for jax_coords.
+    static_coord_vars = _drop_with_none_of_dims(
+        static_coord_vars, variable.dims)
   return DataArray(
       variable, name=name, coords=static_coord_vars, jax_coords=jax_coord_vars)
 
@@ -635,11 +995,36 @@ def _unflatten_dataset(
   data_vars, jax_coord_vars = children
   static_coord_vars = aux
   dataset = xarray.Dataset(data_vars)
-  # Drop static coords which have dims not present in any of the data_vars.
-  # See corresponding comment in _unflatten_data_array.
-  static_coord_vars = _drop_with_none_of_dims(static_coord_vars, dataset.dims)  # pytype: disable=wrong-arg-types
+  if _DIMS_CHANGE_ON_UNFLATTEN_FN.get(None):
+    # Drop static coords which have dims not present in any of the data_vars.
+    # See corresponding comment in _unflatten_data_array.
+    static_coord_vars = _drop_with_none_of_dims(
+        static_coord_vars, dataset.dims)  # pytype: disable=wrong-arg-types
   return assign_coords(
       dataset, coords=static_coord_vars, jax_coords=jax_coord_vars)
+
+
+def _flatten_datatree(datatree: xarray.DataTree) -> Tuple[
+    Tuple[Mapping[str, xarray.DataTree], xarray.Dataset], str | None]:
+  """Flattens a DataTree for jax.tree_util."""
+  # For simplicity we assume DataTrees will be flattened/unflattened from the
+  # root. If you give it a non-root-node, it will still work but any parents
+  # (and any coordinates inherited from them) will be lost.
+  node_dataset = datatree.to_dataset(inherit=False)
+  children = (dict(datatree.children), node_dataset)
+  aux = datatree.name
+  return children, aux
+
+
+def _unflatten_datatree(
+    aux: str | None,
+    children: Tuple[Mapping[str, xarray.DataTree], xarray.Dataset],
+) -> xarray.DataTree:
+  """Unflattens a DataTree for jax.tree_util."""
+  children_dict, node_dataset = children
+  name = aux
+  return xarray.DataTree(
+      dataset=node_dataset, children=children_dict, name=name)
 
 
 jax.tree_util.register_pytree_node(
@@ -653,3 +1038,5 @@ jax.tree_util.register_pytree_node(
     xarray.DataArray, _flatten_data_array, _unflatten_data_array)
 jax.tree_util.register_pytree_node(
     xarray.Dataset, _flatten_dataset, _unflatten_dataset)
+jax.tree_util.register_pytree_node(
+    xarray.DataTree, _flatten_datatree, _unflatten_datatree)
