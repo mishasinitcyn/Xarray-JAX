@@ -681,6 +681,53 @@ class XarrayJaxTest(absltest.TestCase):
     xarray.testing.assert_equal(
         result.g.variable, xarray.Variable(('g2',), np.arange(2)))
 
+  def test_assign_coords(self):
+    inputs = xarray_jax.DataArray(
+        jnp.ones((3, 4)),
+        dims=['lat', 'lon'],
+        jax_coords={'lat': jnp.arange(3)},
+    )
+    self.assertIsInstance(inputs.coords['lat'].data, xarray_jax.JaxArrayWrapper)
+    self.assertNotIn('lat', inputs.indexes)
+
+    def fn(data_array):
+      # Add a new jax_coord and a new static coord
+      data_array = xarray_jax.assign_coords(
+          data_array,
+          coords={'static_coord': 123},
+          jax_coords={'lon': jnp.arange(4) * 10},
+      )
+      # Overwrite an existing jax_coord
+      data_array = xarray_jax.assign_coords(
+          data_array,
+          jax_coords={'lat': jnp.arange(3) + 100},
+      )
+      # Overwrite an existing static coord
+      data_array = data_array.assign_coords(
+          coords={'static_coord': 456},
+      )
+
+      return data_array
+
+    _ = fn(inputs)
+    outputs = fn(inputs)
+
+    # The overwritten jax_coord should be correct
+    self.assertIn('lat', outputs.coords)
+    self.assertIsInstance(outputs.coords['lat'].data, xarray_jax.JaxArrayWrapper)
+    self.assertNotIn('lat', outputs.indexes)
+    chex.assert_trees_all_equal(outputs.coords['lat'].data, jnp.arange(3) + 100)
+
+    # The new jax_coord should be present and correct
+    self.assertIn('lon', outputs.coords)
+    self.assertIsInstance(outputs.coords['lon'].data, xarray_jax.JaxArrayWrapper)
+    self.assertNotIn('lon', outputs.indexes)
+    chex.assert_trees_all_equal(outputs.coords['lon'].data, jnp.arange(4) * 10)
+
+    # The static coord should be present and correctly overwritten
+    self.assertIn('static_coord', outputs.coords)
+    self.assertEqual(outputs.coords['static_coord'].data, 456)
+
 
 if __name__ == '__main__':
   absltest.main()
